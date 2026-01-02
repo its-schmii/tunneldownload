@@ -1,4 +1,6 @@
 cookie_file
+media/*
+media/renamed_files.txt
 
 # default python ignore stuff below
 # Byte-compiled / optimized / DLL files
