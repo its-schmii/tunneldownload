@@ -4,16 +4,24 @@ import dateparser
 import datetime
 import logging
 import os
+import re
 from bs4 import BeautifulSoup
+import rename_fooni_files as rff
+
 
 # some config
+# media_url = "https://media.fööni.fi"
 media_url = "https://media.xn--fni-snaa.fi"
-proflyer_url = media_url + "/proflyer"
+proflyer_url = media_url + "/proflyer_login"
 debug = False
 pbar = None
 
-
 # TODO: add progressbar
+
+
+def sort_dicts_by_session(dict_list: list[dict]) -> list[dict]:
+    """Sort list of dicts by 'session' datetime, oldest first."""
+    return sorted(dict_list, key=lambda d: d["session_time"])
 
 
 def proflyer_request(cookie):
@@ -23,12 +31,12 @@ def proflyer_request(cookie):
         response = requests.get(proflyer_url, headers={"Cookie": cookie})
         return response
     except requests.exceptions.RequestException as e:  # This is the correct syntax
-        print("Error on requesting {}".format(proflyer_url))
+        print(f"Error on requesting {proflyer_url}")
         raise SystemExit(e)
 
 
 def set_filter(url, cookie):
-    logging.debug("Trying to set filter over url {}".format(media_url + "/" + url))
+    logging.debug(f"Trying to set filter over url {media_url}/{url}")
     try:
         response = requests.get(media_url + "/" + url, headers={"Cookie": cookie})
         return response
@@ -37,23 +45,32 @@ def set_filter(url, cookie):
 
 
 def get_video_urls_from_session(session, cookie, perspective):
-    logging.info("Getting videos from session {}".format(session["session_time"]))
+    logging.info(f"\nGetting videos from session {session['session_time']}")
     response = set_filter(session["filter_url"], cookie)
 
     logging.info("Parsing HTML Response")
     soup = BeautifulSoup(response.text, "html.parser")
     preview_containers = soup.select_one(
-        "#main > div > div:nth-child(2) > div"
+        "#main > div > div:nth-child(2) > div"  # "#main > div > div:nth-child(2) > div"
     ).find_all("div", class_="media_container_responsive", recursive=False)
-    urls = []
+    urls = {}
+
     for container in preview_containers:
-        container_perspective = container.select_one(
-            "div.media_container_responsive > div:nth-child(2) > span"
-        ).text.strip()
-        if container_perspective == perspective or perspective is None:
-            link = container.find("a", class_="btn btn-link download_link")
-            if link is not None:
-                urls.append(link["href"])
+        link = container.find("a", class_="btn btn-link download_link")
+        media_select = container.find("input", class_="media-select")
+        filename = media_select.get("data-filename")
+        new_name = rff.make_new_filename(
+            filename=filename, session_time=session["session_time"].strftime("%H_%M")
+        )
+
+        perspective_in_new_name = [
+            True for p in perspective.lower().split(" ") if p in new_name
+        ]
+
+        if link is not None and (
+            (True in perspective_in_new_name) or (perspective is None)
+        ):
+            urls[new_name] = link["href"]
 
     return urls
 
@@ -63,14 +80,12 @@ def download_sessions(sessions):
         os.mkdir("media")
 
     for session in sessions:
-        logging.info(
-            "Downloading {} videos from session {}".format(
-                len(session["video_urls"]), session["session_time"]
-            )
-        )
         date_path = os.path.join("media", session["session_time"].strftime("%Y-%m-%d"))
         session_path = os.path.join(
             date_path, session["session_time"].strftime("%H_%M")
+        )
+        logging.info(
+            f'\n\n****** Downloading {len(session["video_urls"])} videos from session {session["session_time"]} to {session_path} ****** '
         )
 
         # create necessary paths
@@ -80,20 +95,20 @@ def download_sessions(sessions):
         if not os.path.isdir(session_path):
             os.mkdir(session_path)
 
-        for url in session["video_urls"]:
-            logging.info("Downloading {}".format(url))
-            # not using urlretrieve over requests for file name infos and some header issues
-            response = requests.get(url)
-            file_name = (
-                response.headers["content-disposition"].split("filename=")[1].strip()
-            )
+        for file_name, url in session["video_urls"].items():
+            logging.info(f"- {file_name}")
             v = os.path.join(session_path, file_name)
+
             if not os.path.exists(v):
-                with open(v, "wb") as video:
-                    video.write(response.content)
-                logging.info(
-                    "Downloaded {} successfully to {}".format(file_name, session_path)
-                )
+                try:
+                    response = requests.get(url)
+                    with open(v, "wb") as video:
+                        video.write(response.content)
+                    logging.info(f"  success!")
+                except Exception as e:
+                    logging.error(f"  ERROR: {e}")
+            else:
+                logging.info(f"  exists")
 
 
 def main():
@@ -101,36 +116,49 @@ def main():
     if debug:
         logging.basicConfig(level=logging.DEBUG)
     else:
-        logging.basicConfig(level=logging.INFO)
+        logging.basicConfig(level=logging.INFO, format="%(message)s")
 
     # some config and cli sugar
     parser = argparse.ArgumentParser(description="Download Fööni Videos.")
     parser.add_argument("cookie_file")
     parser.add_argument(
         "--perspective",
-        help="Set perspective for downloading (Bottom, Sideline, Top, Centerline).\
-        Defaults to all perspectives.",
+        help="Set perspective(s) for downloading (bottom sideline side top centerline center).\
+        Defaults to all perspectives.\
+        When passing multiple perspectives, separate with space",
     )
     parser.add_argument(
         "--start", help="Set start date for downloading. Defaults: today-30days"
+    )
+    parser.add_argument(
+        "--oneday",
+        help="Download videos for start_date only. (y) Defaults: None",
     )
     args = parser.parse_args()
 
     if args.start is None:
         start_date = datetime.date.today() - datetime.timedelta(days=30)
+        start_date = dateparser.parse(str(start_date))
+        end = "to today"
     else:
         start_date = dateparser.parse(args.start)
+        if args.oneday is not None:
+            end = f"to {start_date + datetime.timedelta(days=1)}"
+        else:
+            end = "to today"
+
         if start_date is None:
             raise SystemExit("Start date could not be parsed.")
-        start_date -= datetime.timedelta(days=1)
+        # start_date -= datetime.timedelta(days=1)
 
-    logging.info("Will fetch valid sessions from {} to today".format(start_date))
+    logging.info(f"\nWill fetch valid sessions from {start_date} {end}")
 
     # load cookie file
     with open(args.cookie_file) as f:
         cookie = f.read()
 
     r = proflyer_request(cookie)
+
     # grab all available sessions
     valid_sessions = []
     soup = BeautifulSoup(r.text, "html.parser")
@@ -142,7 +170,12 @@ def main():
     for item in items:
         session_time = dateparser.parse(item.text)
         filter_link = item.find("a")
-        if session_time.date() >= start_date:
+
+        if args.oneday is None:  # download all sessions after start_date
+            condition = session_time.date() >= start_date.date()
+        else:  # download sessions of start_date
+            condition = session_time.date() == start_date.date()
+        if condition:
             valid_sessions.append(
                 {
                     "filter_url": filter_link["href"],
@@ -150,21 +183,17 @@ def main():
                     "video_urls": [],
                 }
             )
-        # print(item.text)
 
-    logging.info("Found {} valid sessions".format(len(valid_sessions)))
+    logging.info(f"Found {len(valid_sessions)} valid sessions")
+
+    valid_sessions = sort_dicts_by_session(valid_sessions)
 
     for session in valid_sessions:
         session["video_urls"] = get_video_urls_from_session(
             session, cookie, args.perspective
         )
-        logging.info(
-            "Fetched {} video urls for session {}".format(
-                len(session["video_urls"]), session["session_time"]
-            )
-        )
+        logging.info(f"Fetched {len(session['video_urls'])} video urls")
 
-    # TODO: order sessions by date
     download_sessions(valid_sessions)
 
 
