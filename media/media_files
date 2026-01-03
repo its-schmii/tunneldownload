@@ -1,0 +1,7 @@
+videos are saved by download.py with the following structure:
+
+folder name: YYYY-MM-DD
+	subfolder name: HH_MM (min MM)
+
+
+this structure is expected by rename_fooni_files.py 
